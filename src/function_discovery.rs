@@ -4,28 +4,26 @@ use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind};
 use crate::context::{CallSite, CallingConvention, FunctionMeta};
 
 pub fn discover_functions(
-    image_base: u32,
-    image_size: usize,
+    text_start: u32,
+    text_end: u32,
     seeds: Vec<u32>,
 ) -> HashMap<u32, FunctionMeta> {
     let mut functions: HashMap<u32, FunctionMeta> = HashMap::new();
     let mut pending: Vec<u32> = seeds;
     let mut seen: HashSet<u32> = HashSet::new();
 
-    let image_end = image_base.wrapping_add(image_size as u32);
-
     while let Some(addr) = pending.pop() {
         if !seen.insert(addr) {
             continue;
         }
-        if addr < image_base || addr >= image_end {
+        if addr < text_start || addr >= text_end {
             continue;
         }
         if functions.len() >= 5000 {
             break;
         }
 
-        let meta = analyze_function_at(addr, image_base, image_end);
+        let meta = analyze_function_at(addr, text_start, text_end);
         for target in &meta.internal_calls {
             if !seen.contains(target) {
                 pending.push(*target);
@@ -37,8 +35,8 @@ pub fn discover_functions(
     functions
 }
 
-fn analyze_function_at(start: u32, image_base: u32, image_end: u32) -> FunctionMeta {
-    let max_len = ((image_end - start) as usize).min(8192);
+fn analyze_function_at(start: u32, text_start: u32, text_end: u32) -> FunctionMeta {
+    let max_len = ((text_end - start) as usize).min(8192);
     let bytes: &[u8] = unsafe { std::slice::from_raw_parts(start as *const u8, max_len) };
 
     let mut decoder = Decoder::with_ip(32, bytes, start as u64, DecoderOptions::NONE);
@@ -62,7 +60,7 @@ fn analyze_function_at(start: u32, image_base: u32, image_end: u32) -> FunctionM
                 address: ip,
                 target,
             });
-            if target >= image_base && target < image_end {
+            if target >= text_start && target < text_end {
                 internal_calls.push(target);
             }
         }

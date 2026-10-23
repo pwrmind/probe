@@ -250,20 +250,44 @@ fn set_mock(ctx: &mut SandboxContext, target: TargetRef, mode: MockMode) {
 fn reset_mock(ctx: &mut SandboxContext, target: ResetTarget) {
     match target {
         ResetTarget::All => {
-            ctx.mocks.clear();
-            println!("[+] all mocks cleared");
+            // Семантика: reset = вернуть всё к "изолировано по умолчанию".
+            // Явно отключить мок можно через `set mock <target> --passthrough`.
+            let functions = &ctx.functions;
+            let mocks = &mut ctx.mocks;
+            mocks.clear();
+            let mut count = 0;
+            for (addr, meta) in functions {
+                if let Ok(Some(m)) =
+                    mock_engine::create_mock(MockBehavior::Default, meta.convention)
+                {
+                    mocks.insert(*addr, m);
+                    count += 1;
+                }
+            }
+            println!("[+] all mocks reset to Default ({} entries)", count);
         }
         ResetTarget::Address(t) => {
             let Some(address) = ctx.resolve_target(&t) else {
                 println!("[-] cannot resolve: {:?}", t);
                 return;
             };
-            ctx.mocks.remove(&address);
-            println!(
-                "[+] mock removed for {} (0x{:08X})",
-                fmt_name(ctx, address),
-                address
-            );
+            let Some(meta) = ctx.functions.get(&address) else {
+                println!("[-] function not found at 0x{:08X}", address);
+                return;
+            };
+            let conv = meta.convention;
+            match mock_engine::create_mock(MockBehavior::Default, conv) {
+                Ok(Some(m)) => {
+                    ctx.mocks.insert(address, m);
+                    println!(
+                        "[+] mock for {} (0x{:08X}) reset to Default (return 0)",
+                        fmt_name(ctx, address),
+                        address
+                    );
+                }
+                Ok(None) => println!("[-] unexpected: Default mock returned None"),
+                Err(e) => println!("[-] mock reset failed: {}", e),
+            }
         }
     }
 }
@@ -276,8 +300,9 @@ pub fn print_help() {
     println!("  invoke function <target> [arg...] [--diff]");
     println!("      target: 0x10001040 or export name (e.g. login)");
     println!("      arg types: 123 / 0x1234 (pointer) / \"string\"");
-    println!("  set mock <target> --return <value>");
-    println!("  set mock <target> --passthrough");
-    println!("  reset mock <target> | --all");
+    println!("  set mock <target> --return <value>       # custom mock (return N)");
+    println!("  set mock <target> --passthrough          # remove mock; real code runs");
+    println!("  reset mock <target>                      # reset that mock to Default (return 0)");
+    println!("  reset mock --all                         # reset ALL mocks to Default (return 0)");
     println!("  help | exit\n");
 }

@@ -64,12 +64,31 @@ pub fn load_and_analyze(path: &Path) -> Result<SandboxContext, String> {
 
     resolve_imports(&pe, img_ptr)?;
 
-    // Seeds: entry + экспорты.
+    // --- Определяем границы .text ---
+    let text_section = pe
+        .sections
+        .iter()
+        .find(|s| s.name.starts_with(b".text"))
+        .ok_or("no .text section")?;
+    let text_va = text_section.virtual_address as usize;
+    let text_size = {
+        let vs = text_section.virtual_size as usize;
+        let rs = text_section.size_of_raw_data as usize;
+        let raw = if vs > 0 { vs } else { rs };
+        raw.min(image_size.saturating_sub(text_va))
+    };
+    let text_start = image_base.wrapping_add(text_va as u32);
+    let text_end = text_start.wrapping_add(text_size as u32);
+
+    // Seeds: entry + только экспорты, попадающие в .text.
     let entry = image_base.wrapping_add(pe.entry as u32);
     let mut seeds: Vec<u32> = vec![entry];
     let mut export_names: HashMap<u32, String> = HashMap::new();
     for exp in &pe.exports {
         let addr = image_base.wrapping_add(exp.rva as u32);
+        if addr < text_start || addr >= text_end {
+            continue;
+        }
         seeds.push(addr);
         if let Some(name) = exp.name.as_ref() {
             export_names.insert(addr, name.to_string());
@@ -79,8 +98,9 @@ pub fn load_and_analyze(path: &Path) -> Result<SandboxContext, String> {
     seeds.dedup();
 
     let functions: HashMap<u32, FunctionMeta> =
-        discover_functions(image_base, image_size, seeds);
+        discover_functions(text_start, text_end, seeds);
 
+    // Авто-моки для всех найденных функций.
     let mut mocks = HashMap::new();
     for (addr, meta) in &functions {
         if let Ok(Some(mock)) =
