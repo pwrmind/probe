@@ -35,7 +35,7 @@ pub enum MockBehavior {
 
 pub struct Mock {
     pub addr: u32,
-    #[allow(dead_code)] // stub size (informational; not needed by Drop)
+    #[allow(dead_code)]
     pub size: usize,
     pub behavior: MockBehavior,
     pub counter_addr: u32,
@@ -49,6 +49,18 @@ impl Drop for Mock {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CallLogEntry {
+    pub index: u32,
+    pub address: u32,
+    pub name: String,
+    pub eax: u32,
+    pub crash: bool,
+    pub crash_code: Option<u32>,
+    pub patch_count: usize,
+    pub total_hits: u32,
+}
+
 pub struct SandboxContext {
     pub file_path: PathBuf,
     pub image_base: u32,
@@ -59,6 +71,7 @@ pub struct SandboxContext {
     pub mocks: HashMap<u32, Mock>,
     pub export_names: HashMap<u32, String>,
     pub allocated: HashMap<u32, usize>,
+    pub call_log: Vec<CallLogEntry>,
 }
 
 impl SandboxContext {
@@ -73,6 +86,7 @@ impl SandboxContext {
             mocks: HashMap::new(),
             export_names: HashMap::new(),
             allocated: HashMap::new(),
+            call_log: Vec::new(),
         }
     }
 

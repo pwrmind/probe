@@ -62,7 +62,6 @@ pub fn load_and_analyze(path: &Path) -> Result<SandboxContext, String> {
         }
     }
 
-    // === КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: заполняем IAT, не ILT ===
     resolve_imports(&pe, img_ptr)?;
 
     let text_section = pe
@@ -120,11 +119,10 @@ pub fn load_and_analyze(path: &Path) -> Result<SandboxContext, String> {
         mocks,
         export_names,
         allocated: HashMap::new(),
+        call_log: Vec::new(),
     })
 }
 
-/// Читает NUL-terminated строку из образа по RVA. Возвращает байты БЕЗ NUL,
-/// но с добавленным NUL в конце, чтобы удобно передать в LoadLibraryA/GetProcAddress.
 fn read_cstr_img(img: *mut u8, rva: usize) -> Result<Vec<u8>, String> {
     unsafe {
         let mut result = Vec::with_capacity(64);
@@ -157,10 +155,8 @@ fn resolve_imports(pe: &PE, img: *mut u8) -> Result<(), String> {
     }
 
     let mut resolved_count = 0usize;
-    let mut skipped_count = 0usize;
     let mut failed_count = 0usize;
 
-    // IMAGE_IMPORT_DESCRIPTOR = 20 bytes; защитный лимит 256 записей
     let max_desc = 256.min(imp_size / 20);
 
     for i in 0..max_desc {
@@ -170,10 +166,6 @@ fn resolve_imports(pe: &PE, img: *mut u8) -> Result<(), String> {
             std::ptr::copy_nonoverlapping(img.add(desc_off), desc.as_mut_ptr(), 20);
         }
 
-        // Поля дескриптора:
-        //   0..4   OriginalFirstThunk (ILT RVA)
-        //   12..16 Name (DLL name RVA)
-        //   16..20 FirstThunk (IAT RVA)
         let original_first_thunk =
             u32::from_le_bytes([desc[0], desc[1], desc[2], desc[3]]) as usize;
         let name_rva =
@@ -182,7 +174,7 @@ fn resolve_imports(pe: &PE, img: *mut u8) -> Result<(), String> {
             u32::from_le_bytes([desc[16], desc[17], desc[18], desc[19]]) as usize;
 
         if original_first_thunk == 0 && name_rva == 0 && first_thunk == 0 {
-            break; // конец массива дескрипторов
+            break;
         }
         if name_rva == 0 || first_thunk == 0 {
             continue;
@@ -197,7 +189,6 @@ fn resolve_imports(pe: &PE, img: *mut u8) -> Result<(), String> {
             continue;
         }
 
-        // Если ILT отсутствует (редкий случай), имена берём из самого IAT
         let ilt_rva = if original_first_thunk != 0 {
             original_first_thunk
         } else {
@@ -217,24 +208,18 @@ fn resolve_imports(pe: &PE, img: *mut u8) -> Result<(), String> {
             }
 
             let resolved: u32 = if entry & 0x8000_0000 != 0 {
-                // Ordinal import: старший бит установлен, младшие 16 — номер
                 let ordinal = (entry & 0xFFFF) as u16;
                 let p = unsafe {
-                    // GetProcAddress с (LPCSTR)(ULONG_PTR)ordinal — стандартный трюк
                     ffi::GetProcAddress(h, ordinal as usize as *const u8)
                 };
                 if p.is_null() {
-                    eprintln!(
-                        "[!] ordinal {} in {} not resolved",
-                        ordinal, dll_display
-                    );
+                    eprintln!("[!] ordinal {} in {} not resolved", ordinal, dll_display);
                     failed_count += 1;
                     j += 1;
                     continue;
                 }
                 p as u32
             } else {
-                // Named import: RVA на IMAGE_IMPORT_BY_NAME (hint:u16, name:cstr)
                 let name_at = entry as usize + 2;
                 let fn_cstr = read_cstr_img(img, name_at)?;
                 let fn_display =
@@ -249,13 +234,10 @@ fn resolve_imports(pe: &PE, img: *mut u8) -> Result<(), String> {
                 p as u32
             };
 
-            // Записываем в IAT (FirstThunk + j*4) — именно эту ячейку
-            // читает thunk-инструкция `jmp [IAT]`.
             unsafe {
                 std::ptr::write_unaligned(img.add(iat_slot_rva) as *mut u32, resolved);
             }
             resolved_count += 1;
-            skipped_count += 0;
             j += 1;
             if j > 4096 {
                 return Err("too many imports in one descriptor".into());
@@ -267,6 +249,5 @@ fn resolve_imports(pe: &PE, img: *mut u8) -> Result<(), String> {
         "[+] imports: resolved={}, failed={}",
         resolved_count, failed_count
     );
-    let _ = skipped_count;
     Ok(())
 }

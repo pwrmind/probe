@@ -9,10 +9,13 @@ pub fn discover_functions(
     seeds: Vec<u32>,
 ) -> HashMap<u32, FunctionMeta> {
     let mut functions: HashMap<u32, FunctionMeta> = HashMap::new();
-    let mut pending: Vec<u32> = seeds;
-    let mut seen: HashSet<u32> = HashSet::new();
+    let mut pending: Vec<u32> = seeds.clone();
+    let mut seen: HashSet<u32> = HashSet::new();      // обработанные
+    let mut queued: HashSet<u32> = seeds.into_iter().collect(); // в pending
 
     while let Some(addr) = pending.pop() {
+        queued.remove(&addr);
+
         if !seen.insert(addr) {
             continue;
         }
@@ -25,7 +28,10 @@ pub fn discover_functions(
 
         let meta = analyze_function_at(addr, text_start, text_end);
         for target in &meta.internal_calls {
-            if !seen.contains(target) {
+            // Отсекаем уже обработанные и уже стоящие в очереди — так
+            // pending не разрастается дубликатами одного и того же адреса,
+            // и при этом ни одна функция не теряется.
+            if !seen.contains(target) && queued.insert(*target) {
                 pending.push(*target);
             }
         }
@@ -52,8 +58,6 @@ fn analyze_function_at(start: u32, text_start: u32, text_end: u32) -> FunctionMe
         let pos_before = decoder.position();
         decoder.decode_out(&mut instr);
 
-        // Import thunk: первая же инструкция — `jmp dword ptr [disp32]`.
-        // Такая функция ровно 6 байт, дальше идти нельзя — там следующий thunk.
         if pos_before == 0
             && instr.mnemonic() == Mnemonic::Jmp
             && instr.op0_kind() == OpKind::Memory

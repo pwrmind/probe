@@ -43,16 +43,13 @@ unsafe extern "system" fn veh_handler(info: *mut ffi::ExceptionPointers) -> i32 
     if info.exception.is_null() || info.context.is_null() {
         return ffi::EXCEPTION_CONTINUE_SEARCH;
     }
-
     let ctx_ptr = CURRENT_CTX.with(|c| c.get());
     if ctx_ptr.is_null() { return ffi::EXCEPTION_CONTINUE_SEARCH; }
     let sbx = &mut *ctx_ptr;
     if sbx.active != 1 { return ffi::EXCEPTION_CONTINUE_SEARCH; }
 
     let rec = &*info.exception;
-    if !is_catchable(rec.code) {
-        return ffi::EXCEPTION_CONTINUE_SEARCH;
-    }
+    if !is_catchable(rec.code) { return ffi::EXCEPTION_CONTINUE_SEARCH; }
 
     let fault_data = if rec.code == ffi::EXCEPTION_ACCESS_VIOLATION && rec.num_params >= 2 {
         rec.info[1]
@@ -95,10 +92,7 @@ pub fn install_veh() {
     unsafe {
         let vh = ffi::AddVectoredExceptionHandler(1, veh_handler);
         if vh.is_null() {
-            eprintln!(
-                "[!] AddVectoredExceptionHandler failed, err={}",
-                ffi::GetLastError()
-            );
+            eprintln!("[!] AddVectoredExceptionHandler failed, err={}", ffi::GetLastError());
         }
         let _ = ffi::SetUnhandledExceptionFilter(uef_handler);
     }
@@ -175,20 +169,17 @@ struct ThreadParams {
 
 unsafe extern "system" fn thread_trampoline(param: *mut c_void) -> u32 {
     let params = &mut *(param as *mut ThreadParams);
-
     let prev = CURRENT_CTX.with(|c| {
         let old = c.get();
         c.set(params.sandbox_ctx);
         old
     });
-
     let raw_eax = probe_call_with_stack(
         params.func,
         params.args_ptr,
         params.arg_count,
         params.sandbox_ctx,
     );
-
     CURRENT_CTX.with(|c| c.set(prev));
     params.result_eax = raw_eax;
     params.completed = 1;
@@ -209,14 +200,9 @@ pub struct BufferDiff {
 }
 
 impl BufferDiff {
-    pub fn readable(&self) -> bool {
-        self.before.is_some() && self.after.is_some()
-    }
+    pub fn readable(&self) -> bool { self.before.is_some() && self.after.is_some() }
     pub fn changed(&self) -> bool {
-        match (&self.before, &self.after) {
-            (Some(a), Some(b)) => a != b,
-            _ => false,
-        }
+        match (&self.before, &self.after) { (Some(a), Some(b)) => a != b, _ => false }
     }
     pub fn changed_count(&self) -> usize {
         match (&self.before, &self.after) {
@@ -251,7 +237,6 @@ pub unsafe fn invoke(
     let window = diff_window.unwrap_or(DEFAULT_DIFF_WINDOW) as usize;
     let diff = diff_window.is_some();
 
-    // Обнуляем счётчики всех моков перед экспериментом.
     for mock in mocks.values() {
         std::ptr::write(mock.counter_addr as *mut u32, 0);
     }
@@ -263,13 +248,11 @@ pub unsafe fn invoke(
             let p = call.address as *mut u8;
             let mut orig = [0u8; 5];
             std::ptr::copy_nonoverlapping(p, orig.as_mut_ptr(), 5);
-
             let rel = (mock.addr as i64 - (call.address as i64 + 5)) as i32;
             let mut newbytes = [0u8; 5];
             newbytes[0] = 0xE8;
             newbytes[1..5].copy_from_slice(&rel.to_le_bytes());
             std::ptr::copy_nonoverlapping(newbytes.as_ptr(), p, 5);
-
             patches.push(Patch { address: call.address, original: orig });
             patched_targets.push(call.target);
         }
@@ -297,9 +280,20 @@ pub unsafe fn invoke(
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
                 heap_ptrs.push(p);
                 arg_vals.push(p as u32);
-                if diff {
-                    watch.push((p as u32, bytes.len()));
+                if diff { watch.push((p as u32, bytes.len())); }
+            }
+            Argument::WideString(s) => {
+                let mut bytes: Vec<u8> = Vec::new();
+                for unit in s.encode_utf16() {
+                    bytes.extend_from_slice(&unit.to_le_bytes());
                 }
+                bytes.extend_from_slice(&[0, 0]); // null terminator (WCHAR)
+                let p = ffi::alloc_rwx(bytes.len())
+                    .ok_or_else(|| "wide string alloc failed".to_string())?;
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+                heap_ptrs.push(p);
+                arg_vals.push(p as u32);
+                if diff { watch.push((p as u32, bytes.len())); }
             }
         }
     }
@@ -313,12 +307,8 @@ pub unsafe fn invoke(
     }
 
     let mut sbx = SandboxCtx {
-        active: 0,
-        saved_esp: 0,
-        recovery_eip: 0,
-        last_fault_code: 0,
-        last_fault_instr: 0,
-        last_fault_data: 0,
+        active: 0, saved_esp: 0, recovery_eip: 0,
+        last_fault_code: 0, last_fault_instr: 0, last_fault_data: 0,
     };
 
     let params = Box::into_raw(Box::new(ThreadParams {
@@ -332,12 +322,8 @@ pub unsafe fn invoke(
 
     let mut tid: u32 = 0;
     let thread = ffi::CreateThread(
-        std::ptr::null_mut(),
-        0,
-        Some(thread_trampoline),
-        params as *mut c_void,
-        0,
-        &mut tid,
+        std::ptr::null_mut(), 0, Some(thread_trampoline),
+        params as *mut c_void, 0, &mut tid,
     );
 
     if thread.is_null() {
@@ -346,9 +332,7 @@ pub unsafe fn invoke(
         for p in &patches {
             std::ptr::copy_nonoverlapping(p.original.as_ptr(), p.address as *mut u8, 5);
         }
-        for p in heap_ptrs {
-            ffi::VirtualFree(p as *mut _, 0, ffi::MEM_RELEASE);
-        }
+        for p in heap_ptrs { ffi::VirtualFree(p as *mut _, 0, ffi::MEM_RELEASE); }
         return Err(format!("CreateThread failed err={}", err));
     }
 
@@ -366,9 +350,7 @@ pub unsafe fn invoke(
     let mut runtime_hits: Vec<(u32, u32)> = Vec::new();
     for (target, mock) in mocks {
         let count = std::ptr::read(mock.counter_addr as *const u32);
-        if count > 0 {
-            runtime_hits.push((*target, count));
-        }
+        if count > 0 { runtime_hits.push((*target, count)); }
     }
     runtime_hits.sort_by_key(|(a, _)| *a);
 
@@ -376,25 +358,17 @@ pub unsafe fn invoke(
     if diff {
         for (addr, size, before) in before_snaps {
             let after = ffi::read_self(addr, size);
-            buffer_diffs.push(BufferDiff {
-                address: addr,
-                size,
-                before,
-                after,
-            });
+            buffer_diffs.push(BufferDiff { address: addr, size, before, after });
         }
     }
 
     for p in &patches {
         std::ptr::copy_nonoverlapping(p.original.as_ptr(), p.address as *mut u8, 5);
     }
-    for p in heap_ptrs {
-        ffi::VirtualFree(p as *mut _, 0, ffi::MEM_RELEASE);
-    }
+    for p in heap_ptrs { ffi::VirtualFree(p as *mut _, 0, ffi::MEM_RELEASE); }
 
     Ok(InvokeResult {
-        eax,
-        crash,
+        eax, crash,
         fault_code: if crash { Some(sbx.last_fault_code) } else { None },
         fault_instr: if crash { Some(sbx.last_fault_instr) } else { None },
         fault_data: if crash && sbx.last_fault_data != 0 { Some(sbx.last_fault_data) } else { None },

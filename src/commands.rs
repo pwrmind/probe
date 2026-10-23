@@ -1,6 +1,6 @@
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
 
-use crate::context::{FunctionMeta, Mock, MockBehavior, SandboxContext};
+use crate::context::{CallLogEntry, FunctionMeta, Mock, MockBehavior, SandboxContext};
 use crate::executor;
 use crate::ffi;
 use crate::mock_engine;
@@ -13,15 +13,22 @@ pub fn dispatch(cmd: Command, ctx: &mut SandboxContext) {
         Command::FindFunction { sort, filter } => show_functions(ctx, sort, filter),
         Command::FindMock { sort, filter } => show_mocks(ctx, sort, filter),
         Command::GetFunction { target } => show_function(ctx, target),
-        Command::InvokeFunction { target, args, diff_window } => {
-            invoke(ctx, target, args, diff_window)
-        }
+        Command::InvokeFunction { target, args, diff_window } => invoke(ctx, target, args, diff_window),
+        Command::InvokeMock { target, args } => invoke_mock(ctx, target, args),
         Command::SetMock { target, mode } => set_mock(ctx, target, mode),
         Command::ResetMock { target } => reset_mock(ctx, target),
         Command::Alloc { size } => cmd_alloc(ctx, size),
         Command::Disasm { target, count } => cmd_disasm(ctx, target, count),
         Command::Peek { address, size } => cmd_peek(address, size),
         Command::Poke { address, bytes } => cmd_poke(address, &bytes),
+        Command::CallLog { clear } => {
+            if clear {
+                ctx.call_log.clear();
+                println!("[+] call log cleared");
+            } else {
+                show_call_log(ctx);
+            }
+        }
         Command::Help => print_help(),
         Command::Exit => unreachable!(),
     }
@@ -46,7 +53,7 @@ fn cmd_disasm(ctx: &SandboxContext, target: TargetRef, count: u32) {
         println!("[-] cannot resolve: {:?}", target);
         return;
     };
-    let want_bytes = ((count as usize) * 16).min(512);
+    let want_bytes = ((count as usize) * 15).clamp(64, 2048);
     let Some(bytes) = (unsafe { ffi::read_self(address, want_bytes) }) else {
         println!("[-] cannot read memory at 0x{:08X}", address);
         return;
@@ -90,13 +97,7 @@ fn cmd_peek(address: u32, size: u32) {
 fn cmd_poke(address: u32, bytes: &[u8]) {
     match unsafe { ffi::write_self(address, bytes) } {
         Some(written) if written == bytes.len() => {
-            println!(
-                "[+] wrote {} byte(s) to 0x{:08X}",
-                written, address
-            );
-            // Показываем то, что реально легло в память (ReadProcessMemory
-            // может вернуть меньше, если пользователь пишет в страницу,
-            // доступную только частично, — редкость, но полезно видеть).
+            println!("[+] wrote {} byte(s) to 0x{:08X}", written, address);
             if let Some(buf) = unsafe { ffi::read_self(address, bytes.len()) } {
                 let hx: Vec<String> = buf.iter().map(|b| format!("{:02X}", b)).collect();
                 println!("    0x{:08X}: {}", address, hx.join(" "));
@@ -104,15 +105,58 @@ fn cmd_poke(address: u32, bytes: &[u8]) {
         }
         Some(written) => println!(
             "[!] partial write: {}/{} bytes to 0x{:08X}",
-            written,
-            bytes.len(),
-            address
+            written, bytes.len(), address
         ),
         None => println!(
             "[-] write failed at 0x{:08X} (bad address or page not writable)",
             address
         ),
     }
+}
+
+fn show_call_log(ctx: &SandboxContext) {
+    if ctx.call_log.is_empty() {
+        println!("(call log is empty). Every `invoke` appends an entry.");
+        return;
+    }
+
+    println!(
+        "{:>3}  {:<28} {:<12} {:<8} {:>7} {:>8}",
+        "#", "Function", "EAX", "Status", "Patch", "Hits"
+    );
+    println!("{}", "-".repeat(74));
+    for e in &ctx.call_log {
+        let display_name = if e.name.chars().count() > 28 {
+            let truncated: String = e.name.chars().take(25).collect();
+            format!("{}...", truncated)
+        } else {
+            e.name.clone()
+        };
+        let status = if e.crash {
+            match e.crash_code {
+                Some(c) => format!("AV/0x{:X}", c & 0xFFFF),
+                None => "CRASH".to_string(),
+            }
+        } else {
+            "ok".to_string()
+        };
+        println!(
+            "{:>3}  {:<28} 0x{:08X}  {:<8} {:>7} {:>8}",
+            e.index, display_name, e.eax, status, e.patch_count, e.total_hits
+        );
+    }
+
+    let unnamed: Vec<&CallLogEntry> = ctx.call_log.iter().filter(|e| e.name == "-").collect();
+    if !unnamed.is_empty() {
+        println!();
+        println!("unnamed entries:");
+        for e in unnamed {
+            println!("  #{}: 0x{:08X}", e.index, e.address);
+        }
+    }
+
+    println!();
+    println!("tip: `call log clear` resets the log.");
 }
 
 fn fmt_name(ctx: &SandboxContext, addr: u32) -> String {
@@ -211,10 +255,7 @@ fn show_mocks(ctx: &SandboxContext, sort: Option<MockColumn>, filter: Option<Str
             MockBehavior::Passthrough => ("passthrough", "-".to_string()),
         };
         let hits = unsafe { std::ptr::read(m.counter_addr as *const u32) };
-        println!(
-            "0x{:08X} {:<16} {:<12} {:>12} {:>5}",
-            addr, name, t, r, hits
-        );
+        println!("0x{:08X} {:<16} {:<12} {:>12} {:>5}", addr, name, t, r, hits);
     }
     println!();
     println!("Hits reflects the LAST invoke; counters reset before each call.");
@@ -223,10 +264,8 @@ fn show_mocks(ctx: &SandboxContext, sort: Option<MockColumn>, filter: Option<Str
 fn show_function(ctx: &SandboxContext, target: TargetRef) {
     let Some(address) = ctx.resolve_target(&target) else {
         println!("[-] cannot resolve: {:?}", target);
-        println!("    hint: use export name or hex address 0x...");
         return;
     };
-
     match ctx.functions.get(&address) {
         Some(f) => {
             let name = fmt_name(ctx, address);
@@ -244,12 +283,7 @@ fn show_function(ctx: &SandboxContext, target: TargetRef) {
     }
 }
 
-fn invoke(
-    ctx: &mut SandboxContext,
-    target: TargetRef,
-    args: Vec<Argument>,
-    diff_window: Option<u32>,
-) {
+fn invoke(ctx: &mut SandboxContext, target: TargetRef, args: Vec<Argument>, diff_window: Option<u32>) {
     let Some(address) = ctx.resolve_target(&target) else {
         println!("[-] cannot resolve: {:?}", target);
         return;
@@ -258,6 +292,22 @@ fn invoke(
         println!("[-] function not found at 0x{:08X}", address);
         return;
     };
+
+    // Если для самой target-функции установлен Custom mock — предупредим,
+    // что `invoke function` его НЕ применит (моки — только для вызовов
+    // ИЗ ДРУГИХ функций). Для проверки stub используйте `invoke mock X`.
+    if let Some(m) = ctx.mocks.get(&address) {
+        if matches!(m.behavior, MockBehavior::Custom(_)) {
+            println!(
+                "[!] note: a custom mock is set for {}. `invoke function` runs the real code;",
+                fmt_name(ctx, address)
+            );
+            println!(
+                "    the mock only affects CALLERS of this function. Use `invoke mock {}` to exercise the stub.",
+                fmt_name(ctx, address)
+            );
+        }
+    }
 
     for (i, a) in args.iter().enumerate() {
         if let Argument::Pointer(p) = a {
@@ -282,7 +332,7 @@ fn invoke(
         }
     }
     if !crt_mocked.is_empty() {
-        println!("[!] warning: this function calls mocked helpers ({}). Their side effects are suppressed.", crt_mocked.join(", "));
+        println!("[!] warning: this function calls mocked helpers ({}). Side effects suppressed.", crt_mocked.join(", "));
     }
 
     let diff_desc = match diff_window {
@@ -291,11 +341,10 @@ fn invoke(
     };
     println!(
         "[*] invoke {} (0x{:08X}) args={:?} diff={}",
-        fmt_name(ctx, address),
-        address,
-        args,
-        diff_desc
+        fmt_name(ctx, address), address, args, diff_desc
     );
+
+    let entry_name = fmt_name(ctx, address);
 
     match unsafe { executor::invoke(&func, &args, &ctx.mocks, diff_window, &ctx.allocated) } {
         Ok(r) => {
@@ -332,8 +381,74 @@ fn invoke(
             if diff_window.is_some() {
                 print_buffer_diffs(&r.buffer_diffs);
             }
+
+            let total_hits: u32 = r.runtime_hits.iter().map(|(_, c)| c).sum();
+            ctx.call_log.push(CallLogEntry {
+                index: ctx.call_log.len() as u32 + 1,
+                address,
+                name: entry_name,
+                eax: r.eax,
+                crash: r.crash,
+                crash_code: r.fault_code,
+                patch_count: r.patch_count,
+                total_hits,
+            });
         }
         Err(e) => println!("[-] invoke failed: {}", e),
+    }
+}
+
+fn invoke_mock(ctx: &mut SandboxContext, target: TargetRef, args: Vec<Argument>) {
+    let Some(address) = ctx.resolve_target(&target) else {
+        println!("[-] cannot resolve: {:?}", target);
+        return;
+    };
+    let Some(func) = ctx.functions.get(&address).cloned() else {
+        println!("[-] function not found at 0x{:08X}", address);
+        return;
+    };
+    let Some(mock) = ctx.mocks.get(&address) else {
+        println!("[-] no mock set for {} (0x{:08X})", fmt_name(ctx, address), address);
+        println!("    hint: use `set mock` first, or `invoke function` to run the real code");
+        return;
+    };
+
+    let mock_meta = FunctionMeta {
+        address: mock.addr,
+        size: mock.size,
+        calls: vec![],
+        internal_calls: vec![],
+        import_calls: vec![],
+        convention: func.convention,
+    };
+
+    println!(
+        "[*] invoke mock {} (stub 0x{:08X}) args={:?}",
+        fmt_name(ctx, address), mock.addr, args
+    );
+
+    let log_name = format!("mock:{}", fmt_name(ctx, address));
+
+    match unsafe { executor::invoke(&mock_meta, &args, &ctx.mocks, None, &ctx.allocated) } {
+        Ok(r) => {
+            if r.crash {
+                println!("[!] mock crashed?! (code 0x{:08X})", r.fault_code.unwrap_or(0));
+            } else {
+                println!("[+] done: EAX = 0x{:08X} ({})", r.eax, r.eax as i32);
+            }
+            let total_hits: u32 = r.runtime_hits.iter().map(|(_, c)| c).sum();
+            ctx.call_log.push(CallLogEntry {
+                index: ctx.call_log.len() as u32 + 1,
+                address: mock.addr,
+                name: log_name,
+                eax: r.eax,
+                crash: r.crash,
+                crash_code: r.fault_code,
+                patch_count: r.patch_count,
+                total_hits,
+            });
+        }
+        Err(e) => println!("[-] invoke mock failed: {}", e),
     }
 }
 
@@ -457,18 +572,21 @@ pub fn print_help() {
     println!("  find mock     [--sort address|name|type|return_value]   [--filter \"col op val\"]");
     println!("  get function <target>");
     println!("  invoke function <target> [arg...] [--diff [N]]");
-    println!("      target: 0x10001040 or export name (e.g. login)");
-    println!("      arg types: 123 / 0x1234 (pointer) / \"string\"");
-    println!("      --diff [N]: snapshot Pointer/String buffers, N bytes each (default 64)");
+    println!("      runs the REAL function (patching its CALLs to mocks)");
+    println!("  invoke mock <target> [arg...]");
+    println!("      runs the STUB set via `set mock` (useful to verify the stub)");
+    println!("      arg types: 123 (int) / 0x1234 (POINTER) / \"str\" (ANSI) / w\"str\" (UTF-16LE)");
+    println!("                 note: 0xFF is a pointer, not int 255. Use decimal 255 for int.");
     println!("  set mock <target> --return <value> | --passthrough");
     println!("  reset mock <target> | --all");
     println!("  alloc <size>");
-    println!("  disasm <target> [count]                    # decode N instructions");
-    println!("  peek 0x<addr> [size]                       # hexdump memory");
-    println!("  poke 0x<addr> <bytes...>                   # write bytes (0xNN / decimal / \"string\")");
+    println!("  disasm <target> [count]");
+    println!("  peek 0x<addr> [size]");
+    println!("  poke 0x<addr> <bytes...>       (0xNN / decimal / \"str\")");
+    println!("  call log [clear]");
     println!("  help | exit");
     println!();
-    println!("Mock hits are per-invoke: reset before call, reported as `runtime mock hits`.");
-    println!("`find mock` shows the counter of the LAST invoke (0 if none).");
+    println!("Mock scope: mocks intercept CALLs from OTHER functions, not from `invoke function` itself.");
+    println!("Use `invoke mock <target>` to test the stub directly.");
     println!();
 }
