@@ -36,7 +36,6 @@ pub struct ExceptionPointers {
     pub context: *mut ContextRecord,
 }
 
-/// x86 CONTEXT (WinSDK winnt.h). Обязательно align(16).
 #[repr(C, align(16))]
 pub struct ContextRecord {
     pub context_flags: u32,
@@ -88,6 +87,14 @@ extern "system" {
         buffer: *mut c_void,
         size: usize,
         bytes_read: *mut usize,
+    ) -> i32;
+
+    pub fn WriteProcessMemory(
+        process: *mut c_void,
+        base_address: *mut c_void,
+        buffer: *const c_void,
+        size: usize,
+        bytes_written: *mut usize,
     ) -> i32;
 
     pub fn AddVectoredExceptionHandler(
@@ -148,4 +155,18 @@ pub unsafe fn read_self(addr: u32, size: usize) -> Option<Vec<u8>> {
     if ok == 0 || read == 0 { return None; }
     buf.truncate(read);
     Some(buf)
+}
+
+pub unsafe fn write_self(addr: u32, data: &[u8]) -> Option<usize> {
+    if addr == 0 || data.is_empty() { return None; }
+    let mut written = 0usize;
+    let ok = WriteProcessMemory(
+        GetCurrentProcess(),
+        addr as *mut _,
+        data.as_ptr() as *const _,
+        data.len(),
+        &mut written,
+    );
+    if ok == 0 || written == 0 { return None; }
+    Some(written)
 }

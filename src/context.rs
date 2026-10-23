@@ -35,10 +35,9 @@ pub enum MockBehavior {
 
 pub struct Mock {
     pub addr: u32,
+    #[allow(dead_code)] // stub size (informational; not needed by Drop)
     pub size: usize,
     pub behavior: MockBehavior,
-    /// Адрес 4-байтовой ячейки внутри той же RWX-страницы, куда
-    /// заглушка делает `inc dword [counter_addr]` при каждом вызове.
     pub counter_addr: u32,
 }
 

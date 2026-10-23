@@ -25,12 +25,18 @@ pub enum Command {
     FindFunction { sort: Option<FunctionColumn>, filter: Option<String> },
     FindMock { sort: Option<MockColumn>, filter: Option<String> },
     GetFunction { target: TargetRef },
-    InvokeFunction { target: TargetRef, args: Vec<Argument>, diff: bool },
+    InvokeFunction {
+        target: TargetRef,
+        args: Vec<Argument>,
+        /// None = no diff. Some(n) = diff with window size n bytes per pointer.
+        diff_window: Option<u32>,
+    },
     SetMock { target: TargetRef, mode: MockMode },
     ResetMock { target: ResetTarget },
     Alloc { size: u32 },
     Disasm { target: TargetRef, count: u32 },
     Peek { address: u32, size: u32 },
+    Poke { address: u32, bytes: Vec<u8> },
     Help,
     Exit,
 }
@@ -115,6 +121,31 @@ fn parse_args_list(tokens: &[String]) -> Result<Vec<Argument>, String> {
     Ok(args)
 }
 
+fn parse_poke_bytes(tokens: &[String]) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    for t in tokens {
+        if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
+            bytes.extend_from_slice(t[1..t.len() - 1].as_bytes());
+        } else if t.starts_with("0x") || t.starts_with("0X") {
+            let v = u32::from_str_radix(&t[2..], 16)
+                .map_err(|_| format!("invalid hex byte '{}'. Expected 0xNN", t))?;
+            if v > 0xFF {
+                return Err(format!("byte value out of range (must be <= 0xFF): {}", t));
+            }
+            bytes.push(v as u8);
+        } else {
+            let v: u32 = t.parse().map_err(|_| {
+                format!("invalid byte '{}'. Expected 0xNN, decimal 0-255, or \"string\"", t)
+            })?;
+            if v > 0xFF {
+                return Err(format!("byte value out of range (must be <= 0xFF): {}", t));
+            }
+            bytes.push(v as u8);
+        }
+    }
+    Ok(bytes)
+}
+
 pub fn parse_command(line: &str) -> Result<Command, String> {
     let tokens = tokenize(line);
     if tokens.is_empty() { return Err("empty command. Type 'help'".into()); }
@@ -157,6 +188,22 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
                 None => 64,
             };
             Ok(Command::Peek { address, size })
+        }
+
+        ("poke", _) => {
+            let addr_str = tokens.get(1).ok_or(
+                "usage: poke 0x<addr> <byte>...    (e.g. poke 0x01840000 0x41 0x42 \"cd\")",
+            )?;
+            if !(addr_str.starts_with("0x") || addr_str.starts_with("0X")) {
+                return Err(format!("invalid address '{}': expected 0x-prefixed", addr_str));
+            }
+            let address = u32::from_str_radix(&addr_str[2..], 16)
+                .map_err(|_| format!("invalid hex address '{}'", addr_str))?;
+            if tokens.len() < 3 {
+                return Err("poke requires at least one byte: poke 0x<addr> 0x41".into());
+            }
+            let bytes = parse_poke_bytes(&tokens[2..])?;
+            Ok(Command::Poke { address, bytes })
         }
 
         ("find", Some("function")) | ("find", Some("fn")) => {
@@ -223,10 +270,10 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
 
         ("invoke", Some("function")) | ("invoke", Some("fn")) => {
             let target = parse_target(tokens.get(2)
-                .ok_or("usage: invoke function <target> [args...] [--diff]")?)?;
+                .ok_or("usage: invoke function <target> [args...] [--diff [N]]")?)?;
 
             let mut args = Vec::new();
-            let mut diff = false;
+            let mut diff_window: Option<u32> = None;
             let mut i = 3;
             while i < tokens.len() {
                 match tokens[i].as_str() {
@@ -242,12 +289,29 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
                         }
                         args = parse_args_list(&buf)?;
                     }
-                    "--diff" => diff = true,
-                    other => return Err(format!("unexpected token '{}'. Args must be in [ ]; use --diff for buffer diff", other)),
+                    "--diff" => {
+                        diff_window = Some(64);
+                        // Опциональное число после --diff задаёт размер окна.
+                        if let Some(next) = tokens.get(i + 1) {
+                            let is_number = !next.starts_with('[')
+                                && !next.starts_with("--")
+                                && !next.starts_with('"');
+                            if is_number {
+                                if let Ok(n) = next.parse::<u32>() {
+                                    if n == 0 {
+                                        return Err("--diff window must be > 0".into());
+                                    }
+                                    diff_window = Some(n);
+                                    i += 1;
+                                }
+                            }
+                        }
+                    }
+                    other => return Err(format!("unexpected token '{}'. Args must be in [ ]; use --diff [N]", other)),
                 }
                 i += 1;
             }
-            Ok(Command::InvokeFunction { target, args, diff })
+            Ok(Command::InvokeFunction { target, args, diff_window })
         }
 
         ("set", Some("mock")) => {

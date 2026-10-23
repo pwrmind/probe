@@ -18,6 +18,7 @@ pub struct SandboxCtx {
 }
 
 const FAULT_MARKER: u32 = 0xDEAD_FA11;
+const DEFAULT_DIFF_WINDOW: u32 = 64;
 
 thread_local! {
     static CURRENT_CTX: Cell<*mut SandboxCtx> = const { Cell::new(std::ptr::null_mut()) };
@@ -234,7 +235,6 @@ pub struct InvokeResult {
     pub abnormal: bool,
     pub patch_count: usize,
     pub patched_targets: Vec<u32>,
-    /// (target_addr, hit_count) — только моки с count > 0.
     pub runtime_hits: Vec<(u32, u32)>,
     pub buffer_diffs: Vec<BufferDiff>,
 }
@@ -243,10 +243,13 @@ pub unsafe fn invoke(
     function: &FunctionMeta,
     args: &[Argument],
     mocks: &HashMap<u32, Mock>,
-    diff: bool,
+    diff_window: Option<u32>,
     allocated: &HashMap<u32, usize>,
 ) -> Result<InvokeResult, String> {
     install_veh();
+
+    let window = diff_window.unwrap_or(DEFAULT_DIFF_WINDOW) as usize;
+    let diff = diff_window.is_some();
 
     // Обнуляем счётчики всех моков перед экспериментом.
     for mock in mocks.values() {
@@ -282,7 +285,7 @@ pub unsafe fn invoke(
             Argument::Pointer(p) => {
                 arg_vals.push(*p);
                 if diff && *p != 0 {
-                    let size = allocated.get(p).copied().unwrap_or(64);
+                    let size = allocated.get(p).copied().unwrap_or(window);
                     watch.push((*p, size));
                 }
             }
@@ -360,7 +363,6 @@ pub unsafe fn invoke(
     let abnormal = !crash && !completed;
     let eax = if crash { FAULT_MARKER } else { raw_eax };
 
-    // Читаем счётчики после выполнения.
     let mut runtime_hits: Vec<(u32, u32)> = Vec::new();
     for (target, mock) in mocks {
         let count = std::ptr::read(mock.counter_addr as *const u32);

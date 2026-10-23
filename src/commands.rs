@@ -13,12 +13,15 @@ pub fn dispatch(cmd: Command, ctx: &mut SandboxContext) {
         Command::FindFunction { sort, filter } => show_functions(ctx, sort, filter),
         Command::FindMock { sort, filter } => show_mocks(ctx, sort, filter),
         Command::GetFunction { target } => show_function(ctx, target),
-        Command::InvokeFunction { target, args, diff } => invoke(ctx, target, args, diff),
+        Command::InvokeFunction { target, args, diff_window } => {
+            invoke(ctx, target, args, diff_window)
+        }
         Command::SetMock { target, mode } => set_mock(ctx, target, mode),
         Command::ResetMock { target } => reset_mock(ctx, target),
         Command::Alloc { size } => cmd_alloc(ctx, size),
         Command::Disasm { target, count } => cmd_disasm(ctx, target, count),
         Command::Peek { address, size } => cmd_peek(address, size),
+        Command::Poke { address, bytes } => cmd_poke(address, &bytes),
         Command::Help => print_help(),
         Command::Exit => unreachable!(),
     }
@@ -81,6 +84,34 @@ fn cmd_peek(address: u32, size: u32) {
             .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
             .collect();
         println!("  {:08X}  {:<47}  {}", off, hx.join(" "), ascii);
+    }
+}
+
+fn cmd_poke(address: u32, bytes: &[u8]) {
+    match unsafe { ffi::write_self(address, bytes) } {
+        Some(written) if written == bytes.len() => {
+            println!(
+                "[+] wrote {} byte(s) to 0x{:08X}",
+                written, address
+            );
+            // Показываем то, что реально легло в память (ReadProcessMemory
+            // может вернуть меньше, если пользователь пишет в страницу,
+            // доступную только частично, — редкость, но полезно видеть).
+            if let Some(buf) = unsafe { ffi::read_self(address, bytes.len()) } {
+                let hx: Vec<String> = buf.iter().map(|b| format!("{:02X}", b)).collect();
+                println!("    0x{:08X}: {}", address, hx.join(" "));
+            }
+        }
+        Some(written) => println!(
+            "[!] partial write: {}/{} bytes to 0x{:08X}",
+            written,
+            bytes.len(),
+            address
+        ),
+        None => println!(
+            "[-] write failed at 0x{:08X} (bad address or page not writable)",
+            address
+        ),
     }
 }
 
@@ -185,6 +216,8 @@ fn show_mocks(ctx: &SandboxContext, sort: Option<MockColumn>, filter: Option<Str
             addr, name, t, r, hits
         );
     }
+    println!();
+    println!("Hits reflects the LAST invoke; counters reset before each call.");
 }
 
 fn show_function(ctx: &SandboxContext, target: TargetRef) {
@@ -211,7 +244,12 @@ fn show_function(ctx: &SandboxContext, target: TargetRef) {
     }
 }
 
-fn invoke(ctx: &mut SandboxContext, target: TargetRef, args: Vec<Argument>, diff: bool) {
+fn invoke(
+    ctx: &mut SandboxContext,
+    target: TargetRef,
+    args: Vec<Argument>,
+    diff_window: Option<u32>,
+) {
     let Some(address) = ctx.resolve_target(&target) else {
         println!("[-] cannot resolve: {:?}", target);
         return;
@@ -247,9 +285,19 @@ fn invoke(ctx: &mut SandboxContext, target: TargetRef, args: Vec<Argument>, diff
         println!("[!] warning: this function calls mocked helpers ({}). Their side effects are suppressed.", crt_mocked.join(", "));
     }
 
-    println!("[*] invoke {} (0x{:08X}) args={:?} diff={}", fmt_name(ctx, address), address, args, diff);
+    let diff_desc = match diff_window {
+        None => "false".to_string(),
+        Some(n) => format!("true (window {} bytes)", n),
+    };
+    println!(
+        "[*] invoke {} (0x{:08X}) args={:?} diff={}",
+        fmt_name(ctx, address),
+        address,
+        args,
+        diff_desc
+    );
 
-    match unsafe { executor::invoke(&func, &args, &ctx.mocks, diff, &ctx.allocated) } {
+    match unsafe { executor::invoke(&func, &args, &ctx.mocks, diff_window, &ctx.allocated) } {
         Ok(r) => {
             if r.crash {
                 println!("[!] sandbox crashed (code 0x{:08X})", r.fault_code.unwrap_or(0));
@@ -281,7 +329,7 @@ fn invoke(ctx: &mut SandboxContext, target: TargetRef, args: Vec<Argument>, diff
             } else if r.patch_count > 0 {
                 println!("    runtime mock hits: (none — all patched calls skipped by branches)");
             }
-            if diff {
+            if diff_window.is_some() {
                 print_buffer_diffs(&r.buffer_diffs);
             }
         }
@@ -408,18 +456,19 @@ pub fn print_help() {
     println!("  find function [--sort address|name|size|calls|imports] [--filter \"col op val\"]");
     println!("  find mock     [--sort address|name|type|return_value]   [--filter \"col op val\"]");
     println!("  get function <target>");
-    println!("  invoke function <target> [arg...] [--diff]");
+    println!("  invoke function <target> [arg...] [--diff [N]]");
     println!("      target: 0x10001040 or export name (e.g. login)");
     println!("      arg types: 123 / 0x1234 (pointer) / \"string\"");
+    println!("      --diff [N]: snapshot Pointer/String buffers, N bytes each (default 64)");
     println!("  set mock <target> --return <value> | --passthrough");
     println!("  reset mock <target> | --all");
     println!("  alloc <size>");
     println!("  disasm <target> [count]                    # decode N instructions");
     println!("  peek 0x<addr> [size]                       # hexdump memory");
+    println!("  poke 0x<addr> <bytes...>                   # write bytes (0xNN / decimal / \"string\")");
     println!("  help | exit");
-    println!("  ");
-    println!("  Mock hits are tracked per-invoke: counters reset before each call,");
-    println!("  non-zero ones reported as `runtime mock hits`. `find mock` shows");
-    println!("  the counter of the LAST invoke (0 if none).");
+    println!();
+    println!("Mock hits are per-invoke: reset before call, reported as `runtime mock hits`.");
+    println!("`find mock` shows the counter of the LAST invoke (0 if none).");
     println!();
 }
