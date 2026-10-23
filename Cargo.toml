@@ -1,0 +1,14 @@
+[package]
+name = "probe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+home = "=0.5.11"
+goblin = "0.9"
+iced-x86 = "1.21"
+rustyline = "14"
+
+[[bin]]
+name = "probe"
+path = "src/main.rs"
