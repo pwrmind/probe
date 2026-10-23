@@ -37,6 +37,9 @@ pub struct Mock {
     pub addr: u32,
     pub size: usize,
     pub behavior: MockBehavior,
+    /// Адрес 4-байтовой ячейки внутри той же RWX-страницы, куда
+    /// заглушка делает `inc dword [counter_addr]` при каждом вызове.
+    pub counter_addr: u32,
 }
 
 impl Drop for Mock {
@@ -56,7 +59,6 @@ pub struct SandboxContext {
     pub functions: HashMap<u32, FunctionMeta>,
     pub mocks: HashMap<u32, Mock>,
     pub export_names: HashMap<u32, String>,
-    /// Адреса, выданные через `alloc`, и их размеры.
     pub allocated: HashMap<u32, usize>,
 }
 

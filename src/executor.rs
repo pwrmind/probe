@@ -72,14 +72,9 @@ unsafe extern "system" fn veh_handler(info: *mut ffi::ExceptionPointers) -> i32 
     ffi::EXCEPTION_CONTINUE_EXECUTION
 }
 
-/// Ключевой момент: без установленного UEF WoW64 при отказе NtContinue
-/// завершает процесс через дефолтный TerminateProcess. С UEF ядро
-/// всё же применяет наш CONTEXT и поток возвращается в Rust.
 unsafe extern "system" fn uef_handler(info: *mut ffi::ExceptionPointers) -> i32 {
-    // Печатаем только если это sandbox-поток — иначе не спамим.
     let ctx_ptr = CURRENT_CTX.with(|c| c.get());
     let in_sandbox = !ctx_ptr.is_null();
-
     if in_sandbox && !info.is_null() {
         let info_ref = &*info;
         if !info_ref.exception.is_null() {
@@ -90,7 +85,6 @@ unsafe extern "system" fn uef_handler(info: *mut ffi::ExceptionPointers) -> i32 
             );
         }
     }
-
     ffi::EXCEPTION_CONTINUE_SEARCH
 }
 
@@ -109,7 +103,6 @@ pub fn install_veh() {
     }
 }
 
-// Родной стек потока, без подмены ESP. Параметры: func, args_ptr, arg_count, sandbox_ctx.
 #[cfg(target_arch = "x86")]
 std::arch::global_asm!(
     r#"
@@ -241,6 +234,8 @@ pub struct InvokeResult {
     pub abnormal: bool,
     pub patch_count: usize,
     pub patched_targets: Vec<u32>,
+    /// (target_addr, hit_count) — только моки с count > 0.
+    pub runtime_hits: Vec<(u32, u32)>,
     pub buffer_diffs: Vec<BufferDiff>,
 }
 
@@ -252,6 +247,11 @@ pub unsafe fn invoke(
     allocated: &HashMap<u32, usize>,
 ) -> Result<InvokeResult, String> {
     install_veh();
+
+    // Обнуляем счётчики всех моков перед экспериментом.
+    for mock in mocks.values() {
+        std::ptr::write(mock.counter_addr as *mut u32, 0);
+    }
 
     let mut patches: Vec<Patch> = Vec::new();
     let mut patched_targets: Vec<u32> = Vec::new();
@@ -360,6 +360,16 @@ pub unsafe fn invoke(
     let abnormal = !crash && !completed;
     let eax = if crash { FAULT_MARKER } else { raw_eax };
 
+    // Читаем счётчики после выполнения.
+    let mut runtime_hits: Vec<(u32, u32)> = Vec::new();
+    for (target, mock) in mocks {
+        let count = std::ptr::read(mock.counter_addr as *const u32);
+        if count > 0 {
+            runtime_hits.push((*target, count));
+        }
+    }
+    runtime_hits.sort_by_key(|(a, _)| *a);
+
     let mut buffer_diffs: Vec<BufferDiff> = Vec::new();
     if diff {
         for (addr, size, before) in before_snaps {
@@ -389,6 +399,7 @@ pub unsafe fn invoke(
         abnormal,
         patch_count: patches.len(),
         patched_targets,
+        runtime_hits,
         buffer_diffs,
     })
 }

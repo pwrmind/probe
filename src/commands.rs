@@ -56,9 +56,7 @@ fn cmd_disasm(ctx: &SandboxContext, target: TargetRef, count: u32) {
     let mut out = String::new();
 
     for _ in 0..count {
-        if !decoder.can_decode() {
-            break;
-        }
+        if !decoder.can_decode() { break; }
         let start = decoder.position();
         decoder.decode_out(&mut instr);
         let end = decoder.position();
@@ -169,7 +167,10 @@ fn show_mocks(ctx: &SandboxContext, sort: Option<MockColumn>, filter: Option<Str
         return;
     }
 
-    println!("{:<10} {:<16} {:>5} {:<12} {:>12}", "MockAddr", "Name", "Size", "Type", "Return");
+    println!(
+        "{:<10} {:<16} {:<12} {:>12} {:>5}",
+        "MockAddr", "Name", "Type", "Return", "Hits"
+    );
     println!("{}", "-".repeat(64));
     for (addr, m) in items {
         let name = fmt_name(ctx, addr);
@@ -178,7 +179,11 @@ fn show_mocks(ctx: &SandboxContext, sort: Option<MockColumn>, filter: Option<Str
             MockBehavior::Custom(v) => ("custom", format!("0x{:08X}", v)),
             MockBehavior::Passthrough => ("passthrough", "-".to_string()),
         };
-        println!("0x{:08X} {:<16} {:>5} {:<12} {:>12}", addr, name, m.size, t, r);
+        let hits = unsafe { std::ptr::read(m.counter_addr as *const u32) };
+        println!(
+            "0x{:08X} {:<16} {:<12} {:>12} {:>5}",
+            addr, name, t, r, hits
+        );
     }
 }
 
@@ -247,10 +252,7 @@ fn invoke(ctx: &mut SandboxContext, target: TargetRef, args: Vec<Argument>, diff
     match unsafe { executor::invoke(&func, &args, &ctx.mocks, diff, &ctx.allocated) } {
         Ok(r) => {
             if r.crash {
-                println!(
-                    "[!] sandbox crashed (code 0x{:08X})",
-                    r.fault_code.unwrap_or(0)
-                );
+                println!("[!] sandbox crashed (code 0x{:08X})", r.fault_code.unwrap_or(0));
                 if let Some(instr) = r.fault_instr {
                     println!("    fault instruction: 0x{:08X}", instr);
                 }
@@ -270,6 +272,14 @@ fn invoke(ctx: &mut SandboxContext, target: TargetRef, args: Vec<Argument>, diff
                 for t in &r.patched_targets {
                     println!("      -> 0x{:08X}  {}", t, fmt_name(ctx, *t));
                 }
+            }
+            if !r.runtime_hits.is_empty() {
+                println!("    runtime mock hits:");
+                for (t, count) in &r.runtime_hits {
+                    println!("      -> 0x{:08X}  {:<16} x{}", t, fmt_name(ctx, *t), count);
+                }
+            } else if r.patch_count > 0 {
+                println!("    runtime mock hits: (none — all patched calls skipped by branches)");
             }
             if diff {
                 print_buffer_diffs(&r.buffer_diffs);
@@ -407,5 +417,9 @@ pub fn print_help() {
     println!("  disasm <target> [count]                    # decode N instructions");
     println!("  peek 0x<addr> [size]                       # hexdump memory");
     println!("  help | exit");
+    println!("  ");
+    println!("  Mock hits are tracked per-invoke: counters reset before each call,");
+    println!("  non-zero ones reported as `runtime mock hits`. `find mock` shows");
+    println!("  the counter of the LAST invoke (0 if none).");
     println!();
 }
