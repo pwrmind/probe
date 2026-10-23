@@ -12,7 +12,6 @@ pub const EXCEPTION_IN_PAGE_ERROR: u32 = 0xC000_0006;
 pub const EXCEPTION_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
 pub const EXCEPTION_PRIV_INSTRUCTION: u32 = 0xC000_0096;
 pub const EXCEPTION_INT_DIVIDE_BY_ZERO: u32 = 0xC000_0094;
-// pub const EXCEPTION_STACK_OVERFLOW: u32 = 0xC000_00FD;
 pub const EXCEPTION_BREAKPOINT: u32 = 0x8000_0003;
 pub const EXCEPTION_SINGLE_STEP: u32 = 0x8000_0004;
 
@@ -37,8 +36,7 @@ pub struct ExceptionPointers {
     pub context: *mut ContextRecord,
 }
 
-/// x86 CONTEXT (WinSDK winnt.h). Обязательно align(16) — так объявлен
-/// DECLSPEC_ALIGN(16) в официальном заголовке.
+/// x86 CONTEXT (WinSDK winnt.h). Обязательно align(16).
 #[repr(C, align(16))]
 pub struct ContextRecord {
     pub context_flags: u32,
@@ -96,6 +94,12 @@ extern "system" {
         first: u32,
         handler: unsafe extern "system" fn(*mut ExceptionPointers) -> i32,
     ) -> *mut c_void;
+
+    pub fn SetUnhandledExceptionFilter(
+        filter: unsafe extern "system" fn(*mut ExceptionPointers) -> i32,
+    ) -> *mut c_void;
+
+    pub fn GetLastError() -> u32;
 
     pub fn CreateThread(
         attrs: *mut c_void,

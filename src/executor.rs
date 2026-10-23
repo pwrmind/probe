@@ -43,7 +43,6 @@ unsafe extern "system" fn veh_handler(info: *mut ffi::ExceptionPointers) -> i32 
         return ffi::EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // Только активный sandbox-контекст ТЕКУЩЕГО потока.
     let ctx_ptr = CURRENT_CTX.with(|c| c.get());
     if ctx_ptr.is_null() { return ffi::EXCEPTION_CONTINUE_SEARCH; }
     let sbx = &mut *ctx_ptr;
@@ -53,8 +52,6 @@ unsafe extern "system" fn veh_handler(info: *mut ffi::ExceptionPointers) -> i32 
     if !is_catchable(rec.code) {
         return ffi::EXCEPTION_CONTINUE_SEARCH;
     }
-
-    let ctx = &mut *info.context;
 
     let fault_data = if rec.code == ffi::EXCEPTION_ACCESS_VIOLATION && rec.num_params >= 2 {
         rec.info[1]
@@ -67,6 +64,7 @@ unsafe extern "system" fn veh_handler(info: *mut ffi::ExceptionPointers) -> i32 
     sbx.last_fault_data = fault_data;
     sbx.active = 0;
 
+    let ctx = &mut *info.context;
     ctx.eip = sbx.recovery_eip;
     ctx.esp = sbx.saved_esp;
     ctx.eax = FAULT_MARKER;
@@ -74,14 +72,40 @@ unsafe extern "system" fn veh_handler(info: *mut ffi::ExceptionPointers) -> i32 
     ffi::EXCEPTION_CONTINUE_EXECUTION
 }
 
+/// Ключевой момент: без установленного UEF WoW64 при отказе NtContinue
+/// завершает процесс через дефолтный TerminateProcess. С UEF ядро
+/// всё же применяет наш CONTEXT и поток возвращается в Rust.
+unsafe extern "system" fn uef_handler(info: *mut ffi::ExceptionPointers) -> i32 {
+    // Печатаем только если это sandbox-поток — иначе не спамим.
+    let ctx_ptr = CURRENT_CTX.with(|c| c.get());
+    let in_sandbox = !ctx_ptr.is_null();
+
+    if in_sandbox && !info.is_null() {
+        let info_ref = &*info;
+        if !info_ref.exception.is_null() {
+            let rec = &*info_ref.exception;
+            eprintln!(
+                "[UEF] sandbox exception deferred to WoW64: code=0x{:08X} eip=0x{:08X}",
+                rec.code, rec.address as u32
+            );
+        }
+    }
+
+    ffi::EXCEPTION_CONTINUE_SEARCH
+}
+
 pub fn install_veh() {
     static INSTALLED: AtomicBool = AtomicBool::new(false);
     if INSTALLED.swap(true, Ordering::SeqCst) { return; }
     unsafe {
-        let r = ffi::AddVectoredExceptionHandler(1, veh_handler);
-        if r.is_null() {
-            eprintln!("[!] AddVectoredExceptionHandler failed");
+        let vh = ffi::AddVectoredExceptionHandler(1, veh_handler);
+        if vh.is_null() {
+            eprintln!(
+                "[!] AddVectoredExceptionHandler failed, err={}",
+                ffi::GetLastError()
+            );
         }
+        let _ = ffi::SetUnhandledExceptionFilter(uef_handler);
     }
 }
 
@@ -151,7 +175,6 @@ struct ThreadParams {
     args_ptr: *const u32,
     arg_count: u32,
     sandbox_ctx: *mut SandboxCtx,
-    // out-поля, заполняются в sandbox-потоке
     result_eax: u32,
     completed: u32,
 }
@@ -315,6 +338,7 @@ pub unsafe fn invoke(
     );
 
     if thread.is_null() {
+        let err = ffi::GetLastError();
         let _ = Box::from_raw(params);
         for p in &patches {
             std::ptr::copy_nonoverlapping(p.original.as_ptr(), p.address as *mut u8, 5);
@@ -322,7 +346,7 @@ pub unsafe fn invoke(
         for p in heap_ptrs {
             ffi::VirtualFree(p as *mut _, 0, ffi::MEM_RELEASE);
         }
-        return Err("CreateThread failed".to_string());
+        return Err(format!("CreateThread failed err={}", err));
     }
 
     ffi::WaitForSingleObject(thread, ffi::INFINITE);
