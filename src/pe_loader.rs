@@ -62,9 +62,9 @@ pub fn load_and_analyze(path: &Path) -> Result<SandboxContext, String> {
         }
     }
 
+    // === КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: заполняем IAT, не ILT ===
     resolve_imports(&pe, img_ptr)?;
 
-    // --- Определяем границы .text ---
     let text_section = pe
         .sections
         .iter()
@@ -80,7 +80,6 @@ pub fn load_and_analyze(path: &Path) -> Result<SandboxContext, String> {
     let text_start = image_base.wrapping_add(text_va as u32);
     let text_end = text_start.wrapping_add(text_size as u32);
 
-    // Seeds: entry + только экспорты, попадающие в .text.
     let entry = image_base.wrapping_add(pe.entry as u32);
     let mut seeds: Vec<u32> = vec![entry];
     let mut export_names: HashMap<u32, String> = HashMap::new();
@@ -100,13 +99,14 @@ pub fn load_and_analyze(path: &Path) -> Result<SandboxContext, String> {
     let functions: HashMap<u32, FunctionMeta> =
         discover_functions(text_start, text_end, seeds);
 
-    // Авто-моки для всех найденных функций.
     let mut mocks = HashMap::new();
-    for (addr, meta) in &functions {
-        if let Ok(Some(mock)) =
-            mock_engine::create_mock(MockBehavior::Default, meta.convention)
-        {
-            mocks.insert(*addr, mock);
+    for addr in export_names.keys() {
+        if let Some(meta) = functions.get(addr) {
+            if let Ok(Some(mock)) =
+                mock_engine::create_mock(MockBehavior::Default, meta.convention)
+            {
+                mocks.insert(*addr, mock);
+            }
         }
     }
 
@@ -119,42 +119,154 @@ pub fn load_and_analyze(path: &Path) -> Result<SandboxContext, String> {
         functions,
         mocks,
         export_names,
+        allocated: HashMap::new(),
     })
 }
 
-fn resolve_imports(pe: &PE, img: *mut u8) -> Result<(), String> {
-    for imp in &pe.imports {
-        let dll_name = imp.dll.to_string();
-        let mut dll_cstr = dll_name.clone().into_bytes();
-        dll_cstr.push(0);
+/// Читает NUL-terminated строку из образа по RVA. Возвращает байты БЕЗ NUL,
+/// но с добавленным NUL в конце, чтобы удобно передать в LoadLibraryA/GetProcAddress.
+fn read_cstr_img(img: *mut u8, rva: usize) -> Result<Vec<u8>, String> {
+    unsafe {
+        let mut result = Vec::with_capacity(64);
+        let mut p = img.add(rva);
+        for _ in 0..1024 {
+            let b = *p;
+            if b == 0 {
+                result.push(0);
+                return Ok(result);
+            }
+            result.push(b);
+            p = p.add(1);
+        }
+        Err(format!("unterminated string at RVA 0x{:X}", rva))
+    }
+}
 
-        let func_name = imp.name.to_string();
-        if func_name.is_empty() || func_name.starts_with('#') {
+fn resolve_imports(pe: &PE, img: *mut u8) -> Result<(), String> {
+    let opt = pe.header.optional_header.as_ref().ok_or("no optional header")?;
+    let imp_dir = opt
+        .data_directories
+        .get_import_table()
+        .ok_or("no import table directory")?;
+    let imp_rva = imp_dir.virtual_address as usize;
+    let imp_size = imp_dir.size as usize;
+
+    if imp_rva == 0 || imp_size == 0 {
+        eprintln!("[+] imports: none");
+        return Ok(());
+    }
+
+    let mut resolved_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut failed_count = 0usize;
+
+    // IMAGE_IMPORT_DESCRIPTOR = 20 bytes; защитный лимит 256 записей
+    let max_desc = 256.min(imp_size / 20);
+
+    for i in 0..max_desc {
+        let desc_off = imp_rva + i * 20;
+        let mut desc = [0u8; 20];
+        unsafe {
+            std::ptr::copy_nonoverlapping(img.add(desc_off), desc.as_mut_ptr(), 20);
+        }
+
+        // Поля дескриптора:
+        //   0..4   OriginalFirstThunk (ILT RVA)
+        //   12..16 Name (DLL name RVA)
+        //   16..20 FirstThunk (IAT RVA)
+        let original_first_thunk =
+            u32::from_le_bytes([desc[0], desc[1], desc[2], desc[3]]) as usize;
+        let name_rva =
+            u32::from_le_bytes([desc[12], desc[13], desc[14], desc[15]]) as usize;
+        let first_thunk =
+            u32::from_le_bytes([desc[16], desc[17], desc[18], desc[19]]) as usize;
+
+        if original_first_thunk == 0 && name_rva == 0 && first_thunk == 0 {
+            break; // конец массива дескрипторов
+        }
+        if name_rva == 0 || first_thunk == 0 {
             continue;
         }
-        let mut fn_cstr = func_name.clone().into_bytes();
-        fn_cstr.push(0);
 
+        let dll_cstr = read_cstr_img(img, name_rva)?;
+        let dll_display = String::from_utf8_lossy(&dll_cstr[..dll_cstr.len() - 1]).to_string();
         let h = unsafe { ffi::LoadLibraryA(dll_cstr.as_ptr()) };
         if h.is_null() {
-            return Err(format!(
-                "LoadLibraryA({}) failed",
-                String::from_utf8_lossy(&dll_cstr)
-            ));
-        }
-        let p = unsafe { ffi::GetProcAddress(h, fn_cstr.as_ptr()) };
-        if p.is_null() {
-            return Err(format!(
-                "GetProcAddress({}!{}) failed",
-                String::from_utf8_lossy(&dll_cstr),
-                func_name
-            ));
+            eprintln!("[!] LoadLibraryA({}) failed", dll_display);
+            failed_count += 1;
+            continue;
         }
 
-        unsafe {
-            let slot = img.add(imp.rva) as *mut u32;
-            *slot = p as u32;
+        // Если ILT отсутствует (редкий случай), имена берём из самого IAT
+        let ilt_rva = if original_first_thunk != 0 {
+            original_first_thunk
+        } else {
+            first_thunk
+        };
+
+        let mut j = 0usize;
+        loop {
+            let ilt_entry_rva = ilt_rva + j * 4;
+            let iat_slot_rva = first_thunk + j * 4;
+
+            let entry = unsafe {
+                std::ptr::read_unaligned(img.add(ilt_entry_rva) as *const u32)
+            };
+            if entry == 0 {
+                break;
+            }
+
+            let resolved: u32 = if entry & 0x8000_0000 != 0 {
+                // Ordinal import: старший бит установлен, младшие 16 — номер
+                let ordinal = (entry & 0xFFFF) as u16;
+                let p = unsafe {
+                    // GetProcAddress с (LPCSTR)(ULONG_PTR)ordinal — стандартный трюк
+                    ffi::GetProcAddress(h, ordinal as usize as *const u8)
+                };
+                if p.is_null() {
+                    eprintln!(
+                        "[!] ordinal {} in {} not resolved",
+                        ordinal, dll_display
+                    );
+                    failed_count += 1;
+                    j += 1;
+                    continue;
+                }
+                p as u32
+            } else {
+                // Named import: RVA на IMAGE_IMPORT_BY_NAME (hint:u16, name:cstr)
+                let name_at = entry as usize + 2;
+                let fn_cstr = read_cstr_img(img, name_at)?;
+                let fn_display =
+                    String::from_utf8_lossy(&fn_cstr[..fn_cstr.len() - 1]).to_string();
+                let p = unsafe { ffi::GetProcAddress(h, fn_cstr.as_ptr()) };
+                if p.is_null() {
+                    eprintln!("[!] {}.{} not resolved", dll_display, fn_display);
+                    failed_count += 1;
+                    j += 1;
+                    continue;
+                }
+                p as u32
+            };
+
+            // Записываем в IAT (FirstThunk + j*4) — именно эту ячейку
+            // читает thunk-инструкция `jmp [IAT]`.
+            unsafe {
+                std::ptr::write_unaligned(img.add(iat_slot_rva) as *mut u32, resolved);
+            }
+            resolved_count += 1;
+            skipped_count += 0;
+            j += 1;
+            if j > 4096 {
+                return Err("too many imports in one descriptor".into());
+            }
         }
     }
+
+    eprintln!(
+        "[+] imports: resolved={}, failed={}",
+        resolved_count, failed_count
+    );
+    let _ = skipped_count;
     Ok(())
 }

@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 home = "=0.5.11"
 goblin = "0.9"
-iced-x86 = "1.21"
+iced-x86 = { version = "1.21", features = ["intel"] }
 rustyline = "14"
 
 [[bin]]

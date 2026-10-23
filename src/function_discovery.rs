@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind};
+use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 
 use crate::context::{CallSite, CallingConvention, FunctionMeta};
 
@@ -51,6 +51,18 @@ fn analyze_function_at(start: u32, text_start: u32, text_end: u32) -> FunctionMe
     while decoder.can_decode() {
         let pos_before = decoder.position();
         decoder.decode_out(&mut instr);
+
+        // Import thunk: первая же инструкция — `jmp dword ptr [disp32]`.
+        // Такая функция ровно 6 байт, дальше идти нельзя — там следующий thunk.
+        if pos_before == 0
+            && instr.mnemonic() == Mnemonic::Jmp
+            && instr.op0_kind() == OpKind::Memory
+            && instr.memory_base() == Register::None
+            && instr.memory_index() == Register::None
+        {
+            end_offset = decoder.position();
+            break;
+        }
 
         let ip = instr.ip() as u32;
 

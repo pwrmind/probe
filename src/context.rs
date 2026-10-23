@@ -56,6 +56,8 @@ pub struct SandboxContext {
     pub functions: HashMap<u32, FunctionMeta>,
     pub mocks: HashMap<u32, Mock>,
     pub export_names: HashMap<u32, String>,
+    /// Адреса, выданные через `alloc`, и их размеры.
+    pub allocated: HashMap<u32, usize>,
 }
 
 impl SandboxContext {
@@ -69,15 +71,14 @@ impl SandboxContext {
             functions: HashMap::new(),
             mocks: HashMap::new(),
             export_names: HashMap::new(),
+            allocated: HashMap::new(),
         }
     }
 
-    /// Возвращает имя экспорта для адреса, если есть.
     pub fn name_of(&self, addr: u32) -> Option<&String> {
         self.export_names.get(&addr)
     }
 
-    /// Разворачивает TargetRef (адрес или имя) в адрес.
     pub fn resolve_target(&self, t: &TargetRef) -> Option<u32> {
         match t {
             TargetRef::Addr(a) => Some(*a),

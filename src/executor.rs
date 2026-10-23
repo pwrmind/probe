@@ -1,9 +1,91 @@
+use std::cell::Cell;
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::context::{FunctionMeta, Mock};
 use crate::ffi;
 use crate::parser::Argument;
 
-// На i686-pc-windows-msvc C-символы получают префикс `_`.
-// extern "C" ищет `_probe_call_with_stack`, поэтому метка — с подчёркиванием.
+#[repr(C)]
+pub struct SandboxCtx {
+    pub active: u32,
+    pub saved_esp: u32,
+    pub recovery_eip: u32,
+    pub last_fault_code: u32,
+    pub last_fault_instr: u32,
+    pub last_fault_data: u32,
+}
+
+const FAULT_MARKER: u32 = 0xDEAD_FA11;
+
+thread_local! {
+    static CURRENT_CTX: Cell<*mut SandboxCtx> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+fn is_catchable(code: u32) -> bool {
+    matches!(
+        code,
+        ffi::EXCEPTION_ACCESS_VIOLATION
+            | ffi::EXCEPTION_ILLEGAL_INSTRUCTION
+            | ffi::EXCEPTION_PRIV_INSTRUCTION
+            | ffi::EXCEPTION_INT_DIVIDE_BY_ZERO
+            | ffi::EXCEPTION_BREAKPOINT
+            | ffi::EXCEPTION_SINGLE_STEP
+            | ffi::EXCEPTION_IN_PAGE_ERROR
+    )
+}
+
+unsafe extern "system" fn veh_handler(info: *mut ffi::ExceptionPointers) -> i32 {
+    if info.is_null() { return ffi::EXCEPTION_CONTINUE_SEARCH; }
+    let info = &*info;
+    if info.exception.is_null() || info.context.is_null() {
+        return ffi::EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // Только активный sandbox-контекст ТЕКУЩЕГО потока.
+    let ctx_ptr = CURRENT_CTX.with(|c| c.get());
+    if ctx_ptr.is_null() { return ffi::EXCEPTION_CONTINUE_SEARCH; }
+    let sbx = &mut *ctx_ptr;
+    if sbx.active != 1 { return ffi::EXCEPTION_CONTINUE_SEARCH; }
+
+    let rec = &*info.exception;
+    if !is_catchable(rec.code) {
+        return ffi::EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    let ctx = &mut *info.context;
+
+    let fault_data = if rec.code == ffi::EXCEPTION_ACCESS_VIOLATION && rec.num_params >= 2 {
+        rec.info[1]
+    } else {
+        0
+    };
+
+    sbx.last_fault_code = rec.code;
+    sbx.last_fault_instr = rec.address as u32;
+    sbx.last_fault_data = fault_data;
+    sbx.active = 0;
+
+    ctx.eip = sbx.recovery_eip;
+    ctx.esp = sbx.saved_esp;
+    ctx.eax = FAULT_MARKER;
+
+    ffi::EXCEPTION_CONTINUE_EXECUTION
+}
+
+pub fn install_veh() {
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::SeqCst) { return; }
+    unsafe {
+        let r = ffi::AddVectoredExceptionHandler(1, veh_handler);
+        if r.is_null() {
+            eprintln!("[!] AddVectoredExceptionHandler failed");
+        }
+    }
+}
+
+// Родной стек потока, без подмены ESP. Параметры: func, args_ptr, arg_count, sandbox_ctx.
 #[cfg(target_arch = "x86")]
 std::arch::global_asm!(
     r#"
@@ -16,9 +98,14 @@ _probe_call_with_stack:
     push edi
 
     mov ebx, esp
-    mov esp, [ebp+12]
-    mov esi, [ebp+16]
-    mov edi, [ebp+20]
+    mov edx, [ebp+20]
+    lea eax, [probe_recovery_stub]
+    mov [edx + 4], ebx
+    mov [edx + 8], eax
+    mov dword ptr [edx + 0], 1
+
+    mov esi, [ebp+12]
+    mov edi, [ebp+16]
 
 1:
     test edi, edi
@@ -29,7 +116,17 @@ _probe_call_with_stack:
 2:
     call dword ptr [ebp+8]
 
+    mov edx, [ebp+20]
+    mov dword ptr [edx + 0], 0
+
     mov esp, ebx
+    pop edi
+    pop esi
+    pop ebx
+    pop ebp
+    ret
+
+probe_recovery_stub:
     pop edi
     pop esi
     pop ebx
@@ -42,10 +139,43 @@ _probe_call_with_stack:
 extern "C" {
     fn probe_call_with_stack(
         func: u32,
-        new_esp: u32,
         args_ptr: *const u32,
         arg_count: u32,
+        sandbox_ctx: *mut SandboxCtx,
     ) -> u32;
+}
+
+#[repr(C)]
+struct ThreadParams {
+    func: u32,
+    args_ptr: *const u32,
+    arg_count: u32,
+    sandbox_ctx: *mut SandboxCtx,
+    // out-поля, заполняются в sandbox-потоке
+    result_eax: u32,
+    completed: u32,
+}
+
+unsafe extern "system" fn thread_trampoline(param: *mut c_void) -> u32 {
+    let params = &mut *(param as *mut ThreadParams);
+
+    let prev = CURRENT_CTX.with(|c| {
+        let old = c.get();
+        c.set(params.sandbox_ctx);
+        old
+    });
+
+    let raw_eax = probe_call_with_stack(
+        params.func,
+        params.args_ptr,
+        params.arg_count,
+        params.sandbox_ctx,
+    );
+
+    CURRENT_CTX.with(|c| c.set(prev));
+    params.result_eax = raw_eax;
+    params.completed = 1;
+    0
 }
 
 struct Patch {
@@ -53,20 +183,53 @@ struct Patch {
     original: [u8; 5],
 }
 
-pub struct InvokeResult {
-    pub eax: u32,
-    pub patch_count: usize,
-    /// Адреса функций, чьи CALL были перенаправлены на моки.
-    pub patched_targets: Vec<u32>,
+#[derive(Debug, Clone)]
+pub struct BufferDiff {
+    pub address: u32,
+    pub size: usize,
+    pub before: Option<Vec<u8>>,
+    pub after: Option<Vec<u8>>,
 }
 
-/// Патчит прямые CALL на моки, готовит стек, вызывает, восстанавливает патчи.
+impl BufferDiff {
+    pub fn readable(&self) -> bool {
+        self.before.is_some() && self.after.is_some()
+    }
+    pub fn changed(&self) -> bool {
+        match (&self.before, &self.after) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        }
+    }
+    pub fn changed_count(&self) -> usize {
+        match (&self.before, &self.after) {
+            (Some(a), Some(b)) => a.iter().zip(b.iter()).filter(|(x, y)| x != y).count(),
+            _ => 0,
+        }
+    }
+}
+
+pub struct InvokeResult {
+    pub eax: u32,
+    pub crash: bool,
+    pub fault_code: Option<u32>,
+    pub fault_instr: Option<u32>,
+    pub fault_data: Option<u32>,
+    pub abnormal: bool,
+    pub patch_count: usize,
+    pub patched_targets: Vec<u32>,
+    pub buffer_diffs: Vec<BufferDiff>,
+}
+
 pub unsafe fn invoke(
     function: &FunctionMeta,
     args: &[Argument],
-    mocks: &std::collections::HashMap<u32, Mock>,
+    mocks: &HashMap<u32, Mock>,
+    diff: bool,
+    allocated: &HashMap<u32, usize>,
 ) -> Result<InvokeResult, String> {
-    // 1. Патчим прямые CALL, чья цель имеет мок.
+    install_veh();
+
     let mut patches: Vec<Patch> = Vec::new();
     let mut patched_targets: Vec<u32> = Vec::new();
     for call in &function.calls {
@@ -86,13 +249,20 @@ pub unsafe fn invoke(
         }
     }
 
-    // 2. Готовим аргументы: строки копируем в приватную память.
     let mut heap_ptrs: Vec<*mut u8> = Vec::new();
     let mut arg_vals: Vec<u32> = Vec::with_capacity(args.len());
+    let mut watch: Vec<(u32, usize)> = Vec::new();
+
     for a in args {
         match a {
             Argument::Integer(v) => arg_vals.push(*v),
-            Argument::Pointer(p) => arg_vals.push(*p),
+            Argument::Pointer(p) => {
+                arg_vals.push(*p);
+                if diff && *p != 0 {
+                    let size = allocated.get(p).copied().unwrap_or(64);
+                    watch.push((*p, size));
+                }
+            }
             Argument::StringLiteral(s) => {
                 let mut bytes = s.as_bytes().to_vec();
                 bytes.push(0);
@@ -101,39 +271,100 @@ pub unsafe fn invoke(
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
                 heap_ptrs.push(p);
                 arg_vals.push(p as u32);
+                if diff {
+                    watch.push((p as u32, bytes.len()));
+                }
             }
         }
     }
 
-    // 3. Аллоцируем изолированный стек (64 KB).
-    let stack_size = 64 * 1024;
-    let stack_ptr = ffi::alloc_rwx(stack_size)
-        .ok_or_else(|| "stack alloc failed".to_string())?;
-    let stack_top = (stack_ptr as u32) + (stack_size as u32) - 16;
-    let sandbox_esp = stack_top & !0xF;
+    let mut before_snaps: Vec<(u32, usize, Option<Vec<u8>>)> = Vec::new();
+    if diff {
+        for (addr, size) in &watch {
+            let snap = ffi::read_self(*addr, *size);
+            before_snaps.push((*addr, *size, snap));
+        }
+    }
 
-    // 4. Вызов трамплина.
-    let eax = probe_call_with_stack(
-        function.address,
-        sandbox_esp,
-        arg_vals.as_ptr(),
-        arg_vals.len() as u32,
+    let mut sbx = SandboxCtx {
+        active: 0,
+        saved_esp: 0,
+        recovery_eip: 0,
+        last_fault_code: 0,
+        last_fault_instr: 0,
+        last_fault_data: 0,
+    };
+
+    let params = Box::into_raw(Box::new(ThreadParams {
+        func: function.address,
+        args_ptr: arg_vals.as_ptr(),
+        arg_count: arg_vals.len() as u32,
+        sandbox_ctx: &mut sbx as *mut _,
+        result_eax: 0,
+        completed: 0,
+    }));
+
+    let mut tid: u32 = 0;
+    let thread = ffi::CreateThread(
+        std::ptr::null_mut(),
+        0,
+        Some(thread_trampoline),
+        params as *mut c_void,
+        0,
+        &mut tid,
     );
 
-    // 5. Восстанавливаем оригинальные байты CALL.
+    if thread.is_null() {
+        let _ = Box::from_raw(params);
+        for p in &patches {
+            std::ptr::copy_nonoverlapping(p.original.as_ptr(), p.address as *mut u8, 5);
+        }
+        for p in heap_ptrs {
+            ffi::VirtualFree(p as *mut _, 0, ffi::MEM_RELEASE);
+        }
+        return Err("CreateThread failed".to_string());
+    }
+
+    ffi::WaitForSingleObject(thread, ffi::INFINITE);
+    ffi::CloseHandle(thread);
+
+    let params = Box::from_raw(params);
+    let raw_eax = params.result_eax;
+    let completed = params.completed == 1;
+
+    let crash = sbx.last_fault_code != 0;
+    let abnormal = !crash && !completed;
+    let eax = if crash { FAULT_MARKER } else { raw_eax };
+
+    let mut buffer_diffs: Vec<BufferDiff> = Vec::new();
+    if diff {
+        for (addr, size, before) in before_snaps {
+            let after = ffi::read_self(addr, size);
+            buffer_diffs.push(BufferDiff {
+                address: addr,
+                size,
+                before,
+                after,
+            });
+        }
+    }
+
     for p in &patches {
         std::ptr::copy_nonoverlapping(p.original.as_ptr(), p.address as *mut u8, 5);
     }
-
-    // 6. Освобождаем временную память.
-    ffi::VirtualFree(stack_ptr as *mut _, 0, ffi::MEM_RELEASE);
     for p in heap_ptrs {
         ffi::VirtualFree(p as *mut _, 0, ffi::MEM_RELEASE);
     }
 
     Ok(InvokeResult {
         eax,
+        crash,
+        fault_code: if crash { Some(sbx.last_fault_code) } else { None },
+        fault_instr: if crash { Some(sbx.last_fault_instr) } else { None },
+        fault_data: if crash && sbx.last_fault_data != 0 { Some(sbx.last_fault_data) } else { None },
+        abnormal,
         patch_count: patches.len(),
         patched_targets,
+        buffer_diffs,
     })
 }
